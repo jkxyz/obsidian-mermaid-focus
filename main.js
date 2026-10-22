@@ -1,7 +1,22 @@
-const { Plugin, ItemView, MarkdownRenderer, Notice, Platform, setIcon } = require("obsidian");
+const { Component, Plugin, ItemView, MarkdownRenderer, Notice, Platform, setIcon } = require("obsidian");
 const { EditorView } = require("@codemirror/view");
 const VIEW = "mermaid-focus-view";
 let labelId = 0;
+
+function diagramSources(text) {
+	const lines = text.split(/\r?\n/);
+	const diagrams = [];
+	for (let line = 0; line < lines.length; line++) {
+		const fence = lines[line].match(/^\s*(`{3,}|~{3,})(.*)$/);
+		if (!fence) continue;
+		const close = new RegExp(`^\\s*${fence[1][0]}{${fence[1].length},}\\s*$`);
+		let end = line + 1;
+		while (end < lines.length && !close.test(lines[end])) end++;
+		if (/^mermaid\s*$/i.test(fence[2]) && end < lines.length) diagrams.push({ line, source: lines.slice(line, end + 1).join("\n") });
+		line = end;
+	}
+	return diagrams;
+}
 
 function iconButton(parent, label, icon, action) {
 	const el = parent.createEl("button", { cls: "clickable-icon", attr: { type: "button", "aria-label": label, "data-tooltip-position": "top" } });
@@ -158,25 +173,105 @@ class DiagramView extends ItemView {
 	getDisplayText() { return this.state?.sourcePath ? `${this.state.sourcePath.split("/").pop().replace(/\.md$/, "")} · Diagram` : "Diagram"; }
 	getState() { return this.state || {}; }
 
-	async setState(state, result) {
-		const generation = this.generation = (this.generation || 0) + 1;
-		this.state = state;
-		this.canvas?.destroy();
-		this.contentEl.empty();
+	async onOpen() {
 		this.contentEl.addClass("mermaid-focus-view");
-		if (state.source) {
-			await MarkdownRenderer.render(this.app, state.source, this.contentEl, state.sourcePath || "", this);
-			if (generation !== this.generation) return;
-			const svg = this.contentEl.querySelector(".mermaid > svg");
-			if (svg) {
-				const host = svg.parentElement;
-				this.canvas = new DiagramCanvas(host, svg);
+		this.registerEvent(this.app.workspace.on("editor-change", (editor, info) => {
+			if (info.file?.path === this.state?.sourcePath) this.scheduleRefresh(editor.getValue());
+		}));
+		this.registerEvent(this.app.vault.on("modify", (file) => {
+			if (file.path === this.state?.sourcePath) this.scheduleRefresh();
+		}));
+		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+			const path = this.state?.sourcePath;
+			if (path === oldPath || path?.startsWith(`${oldPath}/`)) {
+				this.state = { ...this.state, sourcePath: file.path + path.slice(oldPath.length) };
+				this.scheduleRefresh();
 			}
-		} else this.contentEl.createDiv({ text: "Open a diagram from a note to view it here." });
-		await super.setState(state, result);
+		}));
 	}
 
-	async onClose() { this.generation = (this.generation || 0) + 1; this.canvas?.destroy(); }
+	scheduleRefresh(text) {
+		this.generation = (this.generation || 0) + 1;
+		clearTimeout(this.refreshTimer);
+		this.refreshTimer = setTimeout(() => this.refresh(text), 200);
+	}
+
+	async setState(state, result) {
+		clearTimeout(this.refreshTimer);
+		this.state = state;
+		await this.refresh();
+		await super.setState(this.state, result);
+	}
+
+	async refresh(text) {
+		const generation = this.generation = (this.generation || 0) + 1;
+		let state = this.state || {};
+		let source = state.source;
+		let message = "Open a diagram from a note to view it here.";
+		try {
+			if (state.sourcePath) {
+				const file = this.app.vault.getAbstractFileByPath(state.sourcePath);
+				if (!file || file.extension !== "md") throw new Error("The diagram's source note is unavailable.");
+				if (text == null) {
+					const note = this.app.workspace.getLeavesOfType("markdown").find(({ view }) => view.file?.path === state.sourcePath && view.getMode() === "source");
+					text = note ? note.view.editor.getValue() : await this.app.vault.cachedRead(file);
+				}
+				if (generation !== this.generation) return;
+				const diagrams = diagramSources(text);
+				// Follow unchanged source when earlier blocks move, otherwise use its position.
+				let index = state.diagramIndex;
+				if (diagrams[index]?.source !== source) {
+					const matches = diagrams.map((diagram, i) => ({ ...diagram, i })).filter((diagram) => diagram.source === source);
+					const match = matches.sort((a, b) => Math.abs(a.line - state.line) - Math.abs(b.line - state.line))[0];
+					if (match) index = match.i;
+					else if (state.diagramCount != null && diagrams.length < state.diagramCount) index = -1;
+					else if (index == null) index = diagrams.reduce((best, diagram, i) => Math.abs(diagram.line - state.line) < Math.abs(diagrams[best].line - state.line) ? i : best, 0);
+				}
+				const diagram = diagrams[index];
+				source = diagram?.source;
+				message = "The diagram is missing or its code fence is incomplete.";
+				if (diagram) this.state = state = { ...state, ...diagram, diagramIndex: index, diagramCount: diagrams.length };
+				this.app.workspace.requestSaveLayout();
+			}
+		} catch (error) {
+			source = null;
+			message = error.message;
+		}
+		if (generation !== this.generation) return;
+		const rendered = source || message;
+		if (rendered === this.rendered && state.sourcePath === this.renderedPath) return;
+		this.rendered = null;
+		this.canvas?.destroy();
+		this.canvas = null;
+		if (this.renderChild) this.removeChild(this.renderChild);
+		this.contentEl.empty();
+		// Each render owns its container so a slower render cannot alter a newer one.
+		const content = this.contentEl.createDiv();
+		if (source) {
+			this.renderChild = this.addChild(new Component());
+			try {
+				await MarkdownRenderer.render(this.app, source, content, state.sourcePath || "", this.renderChild);
+				if (generation !== this.generation) return;
+				const svg = content.querySelector(".mermaid > svg");
+				if (svg) this.canvas = new DiagramCanvas(svg.parentElement, svg);
+			} catch (error) {
+				if (generation !== this.generation) return;
+				this.rendered = null;
+				content.empty();
+				content.createDiv({ text: error.message });
+				return;
+			}
+		} else content.createDiv({ text: message });
+		this.rendered = rendered;
+		this.renderedPath = state.sourcePath;
+	}
+
+	async onClose() {
+		clearTimeout(this.refreshTimer);
+		this.generation = (this.generation || 0) + 1;
+		this.canvas?.destroy();
+		if (this.renderChild) this.removeChild(this.renderChild);
+	}
 }
 
 module.exports = class MermaidFocus extends Plugin {
@@ -300,13 +395,10 @@ module.exports = class MermaidFocus extends Plugin {
 			}
 		}
 		if (text == null || line == null) throw new Error("Reopen the note to refresh this diagram's source location.");
-		const lines = text.split("\n");
-		const fence = lines[line]?.match(/^\s*(`{3,}|~{3,})mermaid\s*$/i);
-		if (!fence) throw new Error("The diagram source has changed. Reopen the note and try again.");
-		const close = new RegExp(`^\\s*${fence[1][0]}{${fence[1].length},}\\s*$`);
-		let end = line + 1;
-		while (end < lines.length && !close.test(lines[end])) end++;
-		return { sourcePath: view.file.path, line, source: lines.slice(line, end + 1).join("\n") };
+		const diagrams = diagramSources(text);
+		const diagramIndex = diagrams.findIndex((diagram) => diagram.line === line);
+		if (diagramIndex < 0) throw new Error("The diagram source has changed. Reopen the note and try again.");
+		return { sourcePath: view.file.path, ...diagrams[diagramIndex], diagramIndex, diagramCount: diagrams.length };
 	}
 
 	async openDiagram(record) {
@@ -314,7 +406,7 @@ module.exports = class MermaidFocus extends Plugin {
 			const state = this.sourceFor(record);
 			const existing = this.app.workspace.getLeavesOfType(VIEW).find((leaf) => {
 				const saved = leaf.getViewState().state;
-				return saved?.sourcePath === state.sourcePath && saved?.source === state.source;
+				return saved?.sourcePath === state.sourcePath && (saved.diagramIndex === state.diagramIndex || saved.source === state.source);
 			});
 			const leaf = existing || this.app.workspace.getLeaf("tab");
 			if (!existing) await leaf.setViewState({ type: VIEW, state });

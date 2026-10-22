@@ -25,7 +25,7 @@ An early version developed and tested on Obsidian 1.14.4 for Windows. Mobile and
 
 Uses Obsidian's Mermaid renderer, CodeMirror, and plugin API. No external dependencies, network requests, telemetry, or note writes. Disabling the plugin removes its controls and restores the original diagram elements and code buttons
 
-Diagram tabs retain the selected Mermaid source in their workspace state so they reopen after a restart. Reopen a diagram from its note to pick up source edits
+Diagram tabs refresh automatically when you edit the source note or the file changes externally. They retain the selected diagram in workspace state and load its latest source after a restart
 
 Rendered blocks depend on Obsidian's DOM structure, so future Obsidian or theme updates may need a small compatibility adjustment. Source mode remains the ordinary Markdown editor
 
