@@ -1,0 +1,9 @@
+{
+	"id": "mermaid-focus",
+	"name": "Mermaid Focus",
+	"version": "0.2.0",
+	"minAppVersion": "1.5.0",
+	"description": "Pane-wide Mermaid canvases with zoom, pan, and native diagram tabs.",
+	"author": "Josh Kingsley",
+	"isDesktopOnly": false
+}
